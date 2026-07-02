@@ -34,12 +34,12 @@
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
         <project.build.outputTimestamp>2026-07-02T00:00:00Z</project.build.outputTimestamp>
         <jackson.version>2.19.2</jackson.version>
-        <junit.version>5.10.3</junit.version>
-        <jacoco.version>0.8.14</jacoco.version>
-        <spotbugs.maven.version>4.9.8.3</spotbugs.maven.version>
+        <junit.version>6.1.1</junit.version>
+        <jacoco.version>0.8.15</jacoco.version>
+        <spotbugs.maven.version>4.10.2.0</spotbugs.maven.version>
         <maven.enforcer.version>3.6.3</maven.enforcer.version>
-        <maven.resources.version>3.3.0</maven.resources.version>
-        <maven.compiler.version>3.11.0</maven.compiler.version>
+        <maven.resources.version>3.5.0</maven.resources.version>
+        <maven.compiler.version>3.15.0</maven.compiler.version>
         <maven.jar.version>3.5.0</maven.jar.version>
         <maven.source.version>3.4.0</maven.source.version>
         <maven.javadoc.version>3.12.0</maven.javadoc.version>
@@ -107,7 +107,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-clean-plugin</artifactId>
-                <version>3.2.0</version>
+                <version>3.5.0</version>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -122,7 +122,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
-                <version>3.2.5</version>
+                <version>3.5.6</version>
                 <configuration>
                     <useModulePath>false</useModulePath>
                 </configuration>
@@ -240,7 +240,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-install-plugin</artifactId>
-                <version>3.1.2</version>
+                <version>3.1.4</version>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
