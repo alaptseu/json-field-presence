@@ -19,7 +19,7 @@ objects, and `compareMaps` accepts Java maps. This keeps calls such as
 `compareJson(null, null)` unambiguous at compile time.
 
 Users upgrading from the overloaded 1.x API should follow the
-[migration guide](../MIGRATION.md) and [changelog](../CHANGELOG.md).
+[migration guide](./MIGRATION.md) and [changelog](./CHANGELOG.md).
 
 ## Build and install locally
 
