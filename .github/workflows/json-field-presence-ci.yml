@@ -1,0 +1,150 @@
+name: JSON Field Presence CI
+
+on:
+  push:
+    paths:
+      - "pom.xml"
+      - "mvnw"
+      - "mvnw.cmd"
+      - ".mvn/**"
+      - ".github/scripts/**"
+      - "json-field-presence/**"
+      - ".github/workflows/json-field-presence-ci.yml"
+      - ".github/workflows/json-field-presence-release.yml"
+      - ".github/workflows/json-field-presence-security.yml"
+  pull_request:
+    paths:
+      - "pom.xml"
+      - "mvnw"
+      - "mvnw.cmd"
+      - ".mvn/**"
+      - ".github/scripts/**"
+      - "json-field-presence/**"
+      - ".github/workflows/json-field-presence-ci.yml"
+      - ".github/workflows/json-field-presence-release.yml"
+      - ".github/workflows/json-field-presence-security.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-workflow-tests:
+    name: Test resumable release state checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@70379aad1a8b40919ce8b382d3cd7d0315cde1d0 # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Exercise package preflight and verification states
+        run: bash .github/scripts/test-check-json-field-presence-package.sh
+
+  build:
+    name: Verify on Java ${{ matrix.java }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["17", "21", "25"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@70379aad1a8b40919ce8b382d3cd7d0315cde1d0 # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Java ${{ matrix.java }}
+        uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5.3.0
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+          cache-dependency-path: |
+            pom.xml
+            json-field-presence/pom.xml
+
+      - name: Build and test
+        run: ./mvnw --batch-mode --no-transfer-progress clean verify
+
+      - name: Read project version for reproducibility verification
+        if: matrix.java == '17'
+        id: project-metadata
+        shell: bash
+        run: |
+          version="$(./mvnw --quiet -f json-field-presence/pom.xml help:evaluate -Dexpression=project.version -DforceStdout)"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Preserve the first build for reproducibility verification
+        if: matrix.java == '17'
+        shell: bash
+        env:
+          PROJECT_VERSION: ${{ steps.project-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          first_build="${RUNNER_TEMP}/json-field-presence-first-build"
+          artifacts=(
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}.jar"
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}-sources.jar"
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}-javadoc.jar"
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}-cyclonedx.json"
+            "target/json-field-presence-reactor-${PROJECT_VERSION}.buildinfo"
+          )
+          mkdir -p "${first_build}"
+          for path in "${artifacts[@]}"; do
+            test -f "${path}"
+            cp "${path}" "${first_build}/$(basename "${path}")"
+          done
+
+      - name: Retain packaged JARs and verification reports
+        if: matrix.java == '17'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: json-field-presence-verification-${{ github.sha }}
+          path: |
+            json-field-presence/target/json-field-presence-*.jar
+            json-field-presence/target/json-field-presence-*-cyclonedx.json
+            json-field-presence/target/json-field-presence-*.buildinfo
+            target/json-field-presence-reactor-*.buildinfo
+            json-field-presence/target/site/jacoco/
+            json-field-presence/target/spotbugsXml.xml
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Rebuild artifacts from a clean target
+        if: matrix.java == '17'
+        run: >-
+          ./mvnw --batch-mode --no-transfer-progress
+          -DskipTests clean package
+
+      - name: Compare the two builds
+        if: matrix.java == '17'
+        shell: bash
+        env:
+          PROJECT_VERSION: ${{ steps.project-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          first_build="${RUNNER_TEMP}/json-field-presence-first-build"
+          artifacts=(
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}.jar"
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}-sources.jar"
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}-javadoc.jar"
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}-cyclonedx.json"
+            "target/json-field-presence-reactor-${PROJECT_VERSION}.buildinfo"
+          )
+          for path in "${artifacts[@]}"; do
+            name="$(basename "${path}")"
+            if ! cmp --silent "${first_build}/${name}" "${path}"; then
+              echo "Artifact ${name} was not reproduced byte-for-byte." >&2
+              sha256sum "${first_build}/${name}" "${path}" >&2
+              exit 1
+            fi
+          done

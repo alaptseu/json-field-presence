@@ -1,0 +1,392 @@
+name: JSON Field Presence Release
+
+on:
+  push:
+    tags:
+      - "json-field-presence-v*"
+
+permissions:
+  artifact-metadata: write
+  attestations: write
+  contents: write
+  id-token: write
+  packages: write
+
+concurrency:
+  group: json-field-presence-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and resume release
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@70379aad1a8b40919ce8b382d3cd7d0315cde1d0 # v6.0.2
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Set up Java and GitHub Packages authentication
+        uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5.3.0
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: |
+            pom.xml
+            json-field-presence/pom.xml
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Validate release tag against POM version
+        id: release-metadata
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          PROJECT_VERSION="$(./mvnw --quiet -f json-field-presence/pom.xml help:evaluate -Dexpression=project.version -DforceStdout)"
+          EXPECTED_TAG="json-field-presence-v${PROJECT_VERSION}"
+          if [[ "${RELEASE_TAG}" != "${EXPECTED_TAG}" ]]; then
+            echo "Release tag ${RELEASE_TAG} must equal ${EXPECTED_TAG}." >&2
+            exit 1
+          fi
+          echo "version=${PROJECT_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and verify release artifacts for the first time
+        run: >-
+          ./mvnw --batch-mode --no-transfer-progress
+          -f json-field-presence/pom.xml clean verify
+
+      - name: Preserve the first build
+        shell: bash
+        env:
+          PROJECT_VERSION: ${{ steps.release-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          target="json-field-presence/target"
+          first_build="${RUNNER_TEMP}/json-field-presence-first-build-${PROJECT_VERSION}"
+          artifacts=(
+            "json-field-presence-${PROJECT_VERSION}.jar"
+            "json-field-presence-${PROJECT_VERSION}-sources.jar"
+            "json-field-presence-${PROJECT_VERSION}-javadoc.jar"
+            "json-field-presence-${PROJECT_VERSION}-cyclonedx.json"
+            "json-field-presence-${PROJECT_VERSION}.buildinfo"
+          )
+          mkdir -p "${first_build}"
+          for name in "${artifacts[@]}"; do
+            test -f "${target}/${name}"
+            cp "${target}/${name}" "${first_build}/${name}"
+          done
+
+      - name: Rebuild release artifacts from a clean target
+        run: >-
+          ./mvnw --batch-mode --no-transfer-progress
+          -f json-field-presence/pom.xml clean verify
+
+      - name: Verify reproducible release artifacts
+        shell: bash
+        env:
+          PROJECT_VERSION: ${{ steps.release-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          target="json-field-presence/target"
+          first_build="${RUNNER_TEMP}/json-field-presence-first-build-${PROJECT_VERSION}"
+          artifacts=(
+            "json-field-presence-${PROJECT_VERSION}.jar"
+            "json-field-presence-${PROJECT_VERSION}-sources.jar"
+            "json-field-presence-${PROJECT_VERSION}-javadoc.jar"
+            "json-field-presence-${PROJECT_VERSION}-cyclonedx.json"
+            "json-field-presence-${PROJECT_VERSION}.buildinfo"
+          )
+          for name in "${artifacts[@]}"; do
+            if ! cmp --silent "${first_build}/${name}" "${target}/${name}"; then
+              echo "Release artifact ${name} was not reproduced byte-for-byte." >&2
+              sha256sum "${first_build}/${name}" "${target}/${name}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Record release artifact digests
+        shell: bash
+        env:
+          PROJECT_VERSION: ${{ steps.release-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          target="json-field-presence/target"
+          artifacts=(
+            "json-field-presence-${PROJECT_VERSION}.jar"
+            "json-field-presence-${PROJECT_VERSION}-sources.jar"
+            "json-field-presence-${PROJECT_VERSION}-javadoc.jar"
+            "json-field-presence-${PROJECT_VERSION}-cyclonedx.json"
+            "json-field-presence-${PROJECT_VERSION}.buildinfo"
+          )
+          (
+            cd "${target}"
+            sha256sum "${artifacts[@]}"
+          ) > "${target}/SHA256SUMS"
+
+      - name: Preflight package version
+        id: package-state
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_VERSION: ${{ steps.release-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          state="$(bash .github/scripts/check-json-field-presence-package.sh "${PROJECT_VERSION}" allow-absent)"
+          echo "Package state: ${state}"
+          if [[ "${state}" == "absent" ]]; then
+            echo "publish=true" >> "${GITHUB_OUTPUT}"
+          elif [[ "${state}" == "matching" ]]; then
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Unexpected package state: ${state}" >&2
+            exit 1
+          fi
+
+      - name: Create or reuse GitHub Release
+        id: release-state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_VERSION: ${{ steps.release-metadata.outputs.version }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if release_json="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft,isImmutable 2>/dev/null)"; then
+            echo "Reusing the existing release for ${RELEASE_TAG}."
+          else
+            gh release create "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --draft \
+              --verify-tag \
+              --generate-notes \
+              --title "JSON Field Presence ${PROJECT_VERSION}"
+            release_json="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft,isImmutable)"
+          fi
+
+          echo "draft=$(jq --raw-output '.isDraft' <<< "${release_json}")" >> "${GITHUB_OUTPUT}"
+          echo "immutable=$(jq --raw-output '.isImmutable' <<< "${release_json}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload or verify GitHub Release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_VERSION: ${{ steps.release-metadata.outputs.version }}
+          RELEASE_IMMUTABLE: ${{ steps.release-state.outputs.immutable }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          target="json-field-presence/target"
+          assets=(
+            "${target}/json-field-presence-${PROJECT_VERSION}.jar"
+            "${target}/json-field-presence-${PROJECT_VERSION}-sources.jar"
+            "${target}/json-field-presence-${PROJECT_VERSION}-javadoc.jar"
+            "${target}/json-field-presence-${PROJECT_VERSION}-cyclonedx.json"
+            "${target}/json-field-presence-${PROJECT_VERSION}.buildinfo"
+            "${target}/SHA256SUMS"
+          )
+          mapfile -t remote_assets < <(
+            gh release view "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json assets \
+              --jq '.assets[].name'
+          )
+          download_dir="${RUNNER_TEMP}/json-field-presence-release-${PROJECT_VERSION}"
+          mkdir -p "${download_dir}"
+
+          asset_exists() {
+            local expected="$1"
+            local remote
+            for remote in "${remote_assets[@]}"; do
+              if [[ "${remote}" == "${expected}" ]]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          for local_path in "${assets[@]}"; do
+            name="$(basename "${local_path}")"
+            remote_path="${download_dir}/${name}"
+
+            if asset_exists "${name}"; then
+              gh release download "${RELEASE_TAG}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --pattern "${name}" \
+                --dir "${download_dir}"
+              if ! cmp --silent "${local_path}" "${remote_path}"; then
+                echo "Release asset ${name} does not match the locally verified artifact." >&2
+                sha256sum "${local_path}" "${remote_path}" >&2
+                exit 1
+              fi
+            else
+              if [[ "${RELEASE_IMMUTABLE}" == "true" ]]; then
+                echo "Immutable release ${RELEASE_TAG} is missing ${name}; it cannot be resumed automatically." >&2
+                exit 1
+              fi
+              gh release upload "${RELEASE_TAG}" "${local_path}" --repo "${GITHUB_REPOSITORY}"
+            fi
+          done
+
+          verification_dir="${RUNNER_TEMP}/json-field-presence-release-verification-${PROJECT_VERSION}"
+          mkdir -p "${verification_dir}"
+          for local_path in "${assets[@]}"; do
+            name="$(basename "${local_path}")"
+            gh release download "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${name}" \
+              --dir "${verification_dir}"
+            if ! cmp --silent "${local_path}" "${verification_dir}/${name}"; then
+              echo "Downloaded release asset ${name} failed final digest verification." >&2
+              sha256sum "${local_path}" "${verification_dir}/${name}" >&2
+              exit 1
+            fi
+          done
+          (
+            cd "${verification_dir}"
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Publish package version
+        if: steps.package-state.outputs.publish == 'true'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_VERSION: ${{ steps.release-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          module="${GITHUB_WORKSPACE}/json-field-presence"
+          ./mvnw --batch-mode --no-transfer-progress \
+            -f json-field-presence/pom.xml \
+            org.apache.maven.plugins:maven-deploy-plugin:3.1.4:deploy-file \
+            -DrepositoryId=github \
+            -Durl="https://maven.pkg.github.com/${GITHUB_REPOSITORY}" \
+            -Dfile="${module}/target/json-field-presence-${PROJECT_VERSION}.jar" \
+            -DpomFile="${module}/pom.xml" \
+            -Dsources="${module}/target/json-field-presence-${PROJECT_VERSION}-sources.jar" \
+            -Djavadoc="${module}/target/json-field-presence-${PROJECT_VERSION}-javadoc.jar"
+
+      - name: Verify published package digests
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_VERSION: ${{ steps.release-metadata.outputs.version }}
+        run: bash .github/scripts/check-json-field-presence-package.sh "${PROJECT_VERSION}" require-present
+
+      - name: Find missing provenance attestations
+        id: attestation-state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_VERSION: ${{ steps.release-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          artifacts=(
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}.jar"
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}-sources.jar"
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}-javadoc.jar"
+          )
+          missing=()
+          signer_workflow="${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}/.github/workflows/json-field-presence-release.yml"
+          for artifact in "${artifacts[@]}"; do
+            if ! gh attestation verify "${artifact}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --predicate-type "https://slsa.dev/provenance/v1" \
+              --signer-workflow "${signer_workflow}" >/dev/null 2>&1; then
+              missing+=("${artifact}")
+            fi
+          done
+
+          if (( ${#missing[@]} == 0 )); then
+            echo "required=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "required=true" >> "${GITHUB_OUTPUT}"
+            {
+              echo 'subject-path<<EOF'
+              printf '%s\n' "${missing[@]}"
+              echo 'EOF'
+            } >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Attest release JAR provenance
+        if: steps.attestation-state.outputs.required == 'true'
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ steps.attestation-state.outputs.subject-path }}
+
+      - name: Verify provenance attestations
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_VERSION: ${{ steps.release-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          signer_workflow="${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}/.github/workflows/json-field-presence-release.yml"
+          for artifact in \
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}.jar" \
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}-sources.jar" \
+            "json-field-presence/target/json-field-presence-${PROJECT_VERSION}-javadoc.jar"; do
+            gh attestation verify "${artifact}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --predicate-type "https://slsa.dev/provenance/v1" \
+              --signer-workflow "${signer_workflow}"
+          done
+
+      - name: Find the runtime JAR SBOM attestation
+        id: sbom-attestation-state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_VERSION: ${{ steps.release-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          runtime_jar="json-field-presence/target/json-field-presence-${PROJECT_VERSION}.jar"
+          signer_workflow="${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}/.github/workflows/json-field-presence-release.yml"
+          if gh attestation verify "${runtime_jar}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --predicate-type "https://cyclonedx.org/bom" \
+            --signer-workflow "${signer_workflow}" >/dev/null 2>&1; then
+            echo "required=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "required=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Attest runtime JAR SBOM
+        if: steps.sbom-attestation-state.outputs.required == 'true'
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: json-field-presence/target/json-field-presence-${{ steps.release-metadata.outputs.version }}.jar
+          sbom-path: json-field-presence/target/json-field-presence-${{ steps.release-metadata.outputs.version }}-cyclonedx.json
+
+      - name: Verify runtime JAR SBOM attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_VERSION: ${{ steps.release-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          runtime_jar="json-field-presence/target/json-field-presence-${PROJECT_VERSION}.jar"
+          signer_workflow="${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}/.github/workflows/json-field-presence-release.yml"
+          gh attestation verify "${runtime_jar}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --predicate-type "https://cyclonedx.org/bom" \
+            --signer-workflow "${signer_workflow}"
+
+      - name: Publish draft GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          is_draft="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq '.isDraft')"
+          if [[ "${is_draft}" == "true" ]]; then
+            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false
+          else
+            echo "Release ${RELEASE_TAG} is already public."
+          fi
