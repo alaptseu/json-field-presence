@@ -1,0 +1,141 @@
+name: JSON Field Presence CI
+
+on:
+  push:
+    paths:
+      - "pom.xml"
+      - "mvnw"
+      - "mvnw.cmd"
+      - ".mvn/**"
+      - ".github/scripts/**"
+      - "src/**"
+      - ".github/workflows/json-field-presence-ci.yml"
+  pull_request:
+    paths:
+      - "pom.xml"
+      - "mvnw"
+      - "mvnw.cmd"
+      - ".mvn/**"
+      - ".github/scripts/**"
+      - "src/**"
+      - ".github/workflows/json-field-presence-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-workflow-tests:
+    name: Test resumable release state checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+  build:
+    name: Verify on Java ${{ matrix.java }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["17", "21", "25"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Java ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+          cache-dependency-path: |
+            pom.xml
+
+      - name: Build and test
+        run: mvn --batch-mode --no-transfer-progress clean verify
+
+      - name: Read project version for reproducibility verification
+        if: matrix.java == '17'
+        id: project-metadata
+        shell: bash
+        run: |
+          version="$(mvn --quiet -f pom.xml help:evaluate -Dexpression=project.version -DforceStdout)"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Preserve the first build for reproducibility verification
+        if: matrix.java == '17'
+        shell: bash
+        env:
+          PROJECT_VERSION: ${{ steps.project-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          first_build="${RUNNER_TEMP}/json-field-presence-first-build"
+          artifacts=(
+            "target/json-field-presence-${PROJECT_VERSION}.jar"
+            "target/json-field-presence-${PROJECT_VERSION}-sources.jar"
+            "target/json-field-presence-${PROJECT_VERSION}-javadoc.jar"
+            "target/json-field-presence-${PROJECT_VERSION}-cyclonedx.json"
+            "target/json-field-presence-${PROJECT_VERSION}.buildinfo"
+          )
+          mkdir -p "${first_build}"
+          for path in "${artifacts[@]}"; do
+            test -f "${path}"
+            cp "${path}" "${first_build}/$(basename "${path}")"
+          done
+
+      - name: Retain packaged JARs and verification reports
+        if: matrix.java == '17'
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-field-presence-verification-${{ github.sha }}
+          path: |
+            target/json-field-presence-*.jar
+            target/json-field-presence-*-cyclonedx.json
+            target/json-field-presence-*.buildinfo
+            target/site/jacoco/
+            target/spotbugsXml.xml
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Rebuild artifacts from a clean target
+        if: matrix.java == '17'
+        run: >-
+          mvn --batch-mode --no-transfer-progress
+          -DskipTests clean package
+
+      - name: Compare the two builds
+        if: matrix.java == '17'
+        shell: bash
+        env:
+          PROJECT_VERSION: ${{ steps.project-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          first_build="${RUNNER_TEMP}/json-field-presence-first-build"
+          artifacts=(
+            "target/json-field-presence-${PROJECT_VERSION}.jar"
+            "target/json-field-presence-${PROJECT_VERSION}-sources.jar"
+            "target/json-field-presence-${PROJECT_VERSION}-javadoc.jar"
+            "target/json-field-presence-${PROJECT_VERSION}-cyclonedx.json"
+            "target/json-field-presence-${PROJECT_VERSION}.buildinfo"
+          )
+          for path in "${artifacts[@]}"; do
+            name="$(basename "${path}")"
+            if ! cmp --silent "${first_build}/${name}" "${path}"; then
+              echo "Artifact ${name} was not reproduced byte-for-byte." >&2
+              sha256sum "${first_build}/${name}" "${path}" >&2
+              exit 1
+            fi
+          done
